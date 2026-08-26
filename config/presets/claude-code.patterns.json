@@ -1,0 +1,30 @@
+{
+  "_comment": "Regex sources (no flags here — the loader always compiles with 'm' added, per the requirement that every ^-anchored pattern must match per-line, not just buffer-start). Priority when multiple match: error > waiting_input > done > working. Do not add persistent TUI chrome here (e.g. a status bar segment like 'profile:' that renders on every frame regardless of state) — it will always match and starve lower-priority states of a chance to win, and it never signals a real transition.",
+  "error": [
+    "^\\s*(Error|Traceback \\(most recent call last\\)|Exception)\\b",
+    "^\\s*✗\\s",
+    "\\bcommand not found\\b",
+    "\\bfatal:\\s",
+    "\\bAPI Error\\b"
+  ],
+  "waiting_input": [
+    "^\\s*❯\\s*\\d+\\.",
+    "^\\s*❯\\s*$",
+    "\\bDo you want to proceed\\?",
+    "\\(y/n\\)\\s*$",
+    "Yes, I (trust|accept)",
+    "No, exit",
+    "waiting for your input"
+  ],
+  "done": [
+    "^\\s*✓\\s",
+    "\\bTask complete\\b",
+    "\\ball tests pass(ed)?\\b"
+  ],
+  "working": [
+    "^\\s*●\\s",
+    "esc to interrupt",
+    "\\bThinking…\\b",
+    "^\\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\\s"
+  ]
+}

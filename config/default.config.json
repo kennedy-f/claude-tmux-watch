@@ -1,0 +1,19 @@
+{
+  "settleWindowMs": 4000,
+  "backoff": {
+    "workingMs": 12000,
+    "settlingMs": 2000,
+    "settledMs": 3000
+  },
+  "rollingContextEveryN": 5,
+  "logRotation": {
+    "maxBytes": 5242880,
+    "maxFiles": 5
+  },
+  "safetyTimeoutMs": 1500000,
+  "circuitBreaker": {
+    "maxCrashes": 3,
+    "windowMs": 600000
+  },
+  "telegramNotifyOnAutoImprove": true
+}
