@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+fn default_max_capture_failures() -> u32 {
+    3
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneState {
@@ -66,6 +70,8 @@ pub struct CircuitBreakerConfig {
 pub struct WatchDecideConfig {
     pub settle_window_ms: u64,
     pub backoff: BackoffConfig,
+    #[serde(default = "default_max_capture_failures")]
+    pub max_capture_failures: u32,
     pub rolling_context_every_n: u32,
     pub log_rotation: LogRotationConfig,
     pub safety_timeout_ms: u64,
@@ -86,11 +92,12 @@ pub struct DeltaResult {
     pub changed: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionReason {
     StateTransition,
     SafetyTimeout,
+    CaptureFailure,
 }
 
 #[derive(Debug, Clone, Serialize)]

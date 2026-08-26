@@ -38,6 +38,7 @@ pub struct WatchLoop<F: FnMut() -> io::Result<String>> {
     rolling_context: RollingContextAccumulator,
     prev_content: Option<String>,
     pending_delta_lines: Vec<String>,
+    consecutive_capture_failures: u64,
     ms_since_last_event: u64,
     last_interval_ms: u64,
 }
@@ -61,6 +62,7 @@ impl<F: FnMut() -> io::Result<String>> WatchLoop<F> {
             rolling_context,
             prev_content: None,
             pending_delta_lines: Vec::new(),
+            consecutive_capture_failures: 0,
             ms_since_last_event: 0,
             last_interval_ms: 0,
         }
@@ -101,10 +103,49 @@ impl<F: FnMut() -> io::Result<String>> WatchLoop<F> {
         }
     }
 
+    fn build_capture_failure_event(&mut self, err: &io::Error) -> DecisionEvent {
+        self.pending_delta_lines.clear();
+        let message = format!("tmux capture failed: {err}");
+        DecisionEvent {
+            session: self.session.clone(),
+            state: PaneState::Error,
+            delta: message.clone(),
+            summary: message,
+            full_log_path: self.full_log_path.clone(),
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+            reason: DecisionReason::CaptureFailure,
+        }
+    }
+
     pub fn step(&mut self) -> WatchStepResult {
         self.ms_since_last_event += self.last_interval_ms;
 
-        let content = (self.capture_fn)().expect("tmux capture failed");
+        let content = match (self.capture_fn)() {
+            Ok(content) => {
+                self.consecutive_capture_failures = 0;
+                content
+            }
+            Err(err) => {
+                let threshold = u64::from(self.config.max_capture_failures.max(1));
+                self.consecutive_capture_failures += 1;
+                self.last_interval_ms = self.config.backoff.settling_ms;
+                if self.consecutive_capture_failures == threshold {
+                    let event = Some(self.build_capture_failure_event(&err));
+                    self.ms_since_last_event = 0;
+                    return WatchStepResult {
+                        interval_ms: self.last_interval_ms,
+                        event,
+                    };
+                }
+                return WatchStepResult {
+                    interval_ms: self.last_interval_ms,
+                    event: None,
+                };
+            }
+        };
         let mut changed = false;
 
         match &self.prev_content {
@@ -178,6 +219,7 @@ mod tests {
                 settling_ms: 2000,
                 settled_ms: 3000,
             },
+            max_capture_failures: 3,
             rolling_context_every_n: 5,
             log_rotation: LogRotationConfig {
                 max_bytes: 10_000_000,
@@ -202,6 +244,24 @@ mod tests {
         }
     }
 
+    fn make_erroring_capture(
+        results: Vec<io::Result<&str>>,
+    ) -> impl FnMut() -> io::Result<String> {
+        let results: Vec<io::Result<String>> = results
+            .into_iter()
+            .map(|result| result.map(String::from))
+            .collect();
+        let mut i = 0usize;
+        move || {
+            let idx = i.min(results.len() - 1);
+            i += 1;
+            match &results[idx] {
+                Ok(frame) => Ok(frame.clone()),
+                Err(err) => Err(io::Error::new(err.kind(), err.to_string())),
+            }
+        }
+    }
+
     fn make_loop(frames: Vec<&str>) -> WatchLoop<impl FnMut() -> io::Result<String>> {
         WatchLoop::new(WatchLoopDeps {
             session: "s1".to_string(),
@@ -210,6 +270,86 @@ mod tests {
             config: config(),
             log_path: None,
         })
+    }
+
+    #[test]
+    fn capture_failure_emits_event_after_exact_threshold_without_panicking() {
+        let mut cfg = config();
+        cfg.max_capture_failures = 3;
+        let mut l = WatchLoop::new(WatchLoopDeps {
+            session: "s1".to_string(),
+            capture_fn: make_erroring_capture(vec![
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+            ]),
+            patterns: compile_patterns(&patterns()),
+            config: cfg,
+            log_path: None,
+        });
+
+        let r1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| l.step()));
+        let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| l.step()));
+        let r3 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| l.step()));
+
+        assert!(r1.is_ok());
+        assert!(r2.is_ok());
+        let event = r3.unwrap().event.expect("threshold should emit event");
+        assert_eq!(event.state, PaneState::Error);
+        assert_eq!(event.reason, DecisionReason::CaptureFailure);
+        assert!(event.delta.contains("pane missing"));
+        assert!(event.summary.contains("pane missing"));
+    }
+
+    #[test]
+    fn capture_failure_below_threshold_emits_nothing_and_uses_short_interval() {
+        let mut cfg = config();
+        cfg.max_capture_failures = 3;
+        let mut l = WatchLoop::new(WatchLoopDeps {
+            session: "s1".to_string(),
+            capture_fn: make_erroring_capture(vec![
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+            ]),
+            patterns: compile_patterns(&patterns()),
+            config: cfg,
+            log_path: None,
+        });
+
+        let r1 = l.step();
+        let r2 = l.step();
+
+        assert!(r1.event.is_none());
+        assert!(r2.event.is_none());
+        assert_eq!(r1.interval_ms, 2000);
+        assert_eq!(r2.interval_ms, 2000);
+    }
+
+    #[test]
+    fn successful_capture_resets_consecutive_failure_counter() {
+        let mut cfg = config();
+        cfg.max_capture_failures = 3;
+        let mut l = WatchLoop::new(WatchLoopDeps {
+            session: "s1".to_string(),
+            capture_fn: make_erroring_capture(vec![
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Ok("● working again"),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+            ]),
+            patterns: compile_patterns(&patterns()),
+            config: cfg,
+            log_path: None,
+        });
+
+        assert!(l.step().event.is_none());
+        assert!(l.step().event.is_none());
+        assert!(l.step().event.is_none());
+        assert!(l.step().event.is_none());
+        let r5 = l.step();
+        assert!(r5.event.is_none());
+        assert_eq!(r5.interval_ms, 2000);
     }
 
     #[test]

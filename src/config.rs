@@ -131,4 +131,33 @@ mod tests {
         let result = load_patterns_layered(&default_path, &[Some(&missing), None]).unwrap();
         assert_eq!(result.error, vec!["A".to_string()]);
     }
+
+    #[test]
+    fn load_config_uses_default_max_capture_failures_and_allows_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_path = write(
+            dir.path(),
+            "default.config.json",
+            r#"{
+                "settleWindowMs": 4000,
+                "backoff": {"workingMs": 12000, "settlingMs": 2000, "settledMs": 3000},
+                "rollingContextEveryN": 5,
+                "logRotation": {"maxBytes": 5242880, "maxFiles": 5},
+                "safetyTimeoutMs": 1500000,
+                "circuitBreaker": {"maxCrashes": 3, "windowMs": 600000},
+                "telegramNotifyOnAutoImprove": true
+            }"#,
+        );
+        let override_path = write(
+            dir.path(),
+            "override.config.json",
+            r#"{"maxCaptureFailures": 7}"#,
+        );
+
+        let default_cfg = load_config(&default_path, None).unwrap();
+        let override_cfg = load_config(&default_path, Some(&override_path)).unwrap();
+
+        assert_eq!(default_cfg.max_capture_failures, 3);
+        assert_eq!(override_cfg.max_capture_failures, 7);
+    }
 }

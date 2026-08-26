@@ -245,7 +245,8 @@ fn cmd_watch(session: &str, profile: &str, agent: Option<&str>, dry_run: bool, o
         log_path.display()
     );
 
-    // We report crashes ourselves through the circuit breaker below.
+    // Only unexpected panics reach the circuit breaker below; expected
+    // capture-pane failures are emitted as normal decision events.
     std::panic::set_hook(Box::new(|_| {}));
 
     loop {
