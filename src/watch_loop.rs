@@ -248,6 +248,7 @@ mod tests {
     fn make_erroring_capture(
         results: Vec<io::Result<&str>>,
     ) -> impl FnMut() -> io::Result<String> {
+        assert!(!results.is_empty(), "test capture sequence must not be empty");
         let results: Vec<io::Result<String>> = results
             .into_iter()
             .map(|result| result.map(String::from))
