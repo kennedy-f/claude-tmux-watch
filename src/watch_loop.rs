@@ -134,6 +134,7 @@ impl<F: FnMut() -> io::Result<String>> WatchLoop<F> {
                 self.last_interval_ms = self.config.backoff.settling_ms;
                 if self.consecutive_capture_failures == threshold {
                     let event = Some(self.build_capture_failure_event(&err));
+                    self.consecutive_capture_failures = 0;
                     self.ms_since_last_event = 0;
                     return WatchStepResult {
                         interval_ms: self.last_interval_ms,
@@ -350,6 +351,35 @@ mod tests {
         let r5 = l.step();
         assert!(r5.event.is_none());
         assert_eq!(r5.interval_ms, 2000);
+    }
+
+    #[test]
+    fn repeated_capture_failure_episodes_emit_again_after_reset() {
+        let mut cfg = config();
+        cfg.max_capture_failures = 2;
+        let mut l = WatchLoop::new(WatchLoopDeps {
+            session: "s1".to_string(),
+            capture_fn: make_erroring_capture(vec![
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+            ]),
+            patterns: compile_patterns(&patterns()),
+            config: cfg,
+            log_path: None,
+        });
+
+        assert!(l.step().event.is_none());
+        assert!(matches!(
+            l.step().event.as_ref().map(|event| event.reason),
+            Some(DecisionReason::CaptureFailure)
+        ));
+        assert!(l.step().event.is_none());
+        assert!(matches!(
+            l.step().event.as_ref().map(|event| event.reason),
+            Some(DecisionReason::CaptureFailure)
+        ));
     }
 
     #[test]
