@@ -338,6 +338,7 @@ mod tests {
                 Ok("● working again"),
                 Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
                 Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
             ]),
             patterns: compile_patterns(&patterns()),
             config: cfg,
@@ -351,6 +352,11 @@ mod tests {
         let r5 = l.step();
         assert!(r5.event.is_none());
         assert_eq!(r5.interval_ms, 2000);
+        let r6 = l.step();
+        assert!(matches!(
+            r6.event.as_ref().map(|event| event.reason),
+            Some(DecisionReason::CaptureFailure)
+        ));
     }
 
     #[test]
