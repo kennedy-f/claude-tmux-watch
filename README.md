@@ -18,6 +18,14 @@ event instead of the full transcript. Agent-agnostic — the classifier reads
 from a config file, not source, so any tmux-driven CLI can be supported by
 adding a pattern preset (see `config/presets/`).
 
+## Version
+
+Current release: **0.2.0** (see `Cargo.toml`). Check the running binary with:
+
+```
+tmux-watch --version
+```
+
 ## Install
 
 ```
