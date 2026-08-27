@@ -56,8 +56,9 @@ impl CompiledRule {
             .map_err(|e| format!("rule {:?} match regex invalid: {e}", rule.id))?;
         let mut context_allow_res = Vec::new();
         for pat in &rule.requires_context_allow {
-            let re = compile_multiline(pat)
-                .map_err(|e| format!("rule {:?} requiresContextAllow regex invalid: {e}", rule.id))?;
+            let re = compile_multiline(pat).map_err(|e| {
+                format!("rule {:?} requiresContextAllow regex invalid: {e}", rule.id)
+            })?;
             context_allow_res.push(re);
         }
         Ok(Self {
@@ -250,10 +251,7 @@ impl AutoResponder {
                 let ms = now;
                 let secs = (ms / 1000) as i64;
                 let millis = (ms % 1000) as u32;
-                format!(
-                    "{}-auto-respond-{}ms.{}",
-                    secs, millis, rule_id
-                )
+                format!("{}-auto-respond-{}ms.{}", secs, millis, rule_id)
             };
             let _ = append_changelog_entry(path, &entry, &ts);
             if notify_telegram {
@@ -268,11 +266,7 @@ impl AutoResponder {
     }
 
     /// Called when rate-limit suspension is triggered to log it.
-    pub fn log_suspension(
-        rule_id: &str,
-        changelog_path: Option<&Path>,
-        limit: usize,
-    ) {
+    pub fn log_suspension(rule_id: &str, changelog_path: Option<&Path>, limit: usize) {
         let entry = ChangelogEntry {
             what: format!(
                 "Auto-respond rule {:?} suspended: per-rule-per-hour limit ({limit}) reached",
@@ -493,14 +487,20 @@ mod tests {
         for i in 0..3usize {
             let t = base_ms + (i as u128) * 10_000;
             let r = ar.decide("Proceed?", "", Some(t));
-            assert!(matches!(r, AutoRespondDecision::ShouldFire { .. }), "fire {i}");
+            assert!(
+                matches!(r, AutoRespondDecision::ShouldFire { .. }),
+                "fire {i}"
+            );
             if let AutoRespondDecision::ShouldFire { rule_index, keys } = r {
                 ar.commit(rule_index, &keys, None, false, Some(t));
             }
         }
         // 4th attempt: limit reached → suspended.
         let r4 = ar.decide("Proceed?", "", Some(base_ms + 30_001));
-        assert!(matches!(r4, AutoRespondDecision::NoMatch), "expected NoMatch after suspension");
+        assert!(
+            matches!(r4, AutoRespondDecision::NoMatch),
+            "expected NoMatch after suspension"
+        );
     }
 
     // ── session total cap ─────────────────────────────────────────────────────

@@ -5,6 +5,7 @@
     "settlingMs": 2000,
     "settledMs": 3000
   },
+  "maxCaptureFailures": 3,
   "rollingContextEveryN": 5,
   "logRotation": {
     "maxBytes": 5242880,

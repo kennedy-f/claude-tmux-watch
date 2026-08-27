@@ -65,7 +65,10 @@ pub fn send_keys(session: &str, keys: &[String]) -> io::Result<()> {
 
 /// Returns "" when tmux exits non-zero (server not running / no sessions).
 pub fn list_sessions() -> String {
-    match Command::new("tmux").args(build_list_sessions_args()).output() {
+    match Command::new("tmux")
+        .args(build_list_sessions_args())
+        .output()
+    {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).into_owned()
         }

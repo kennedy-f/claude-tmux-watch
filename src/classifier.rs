@@ -19,7 +19,11 @@ fn compile_one(source: &str) -> Regex {
 pub fn compile_patterns(patterns: &PatternConfig) -> CompiledPatterns {
     CompiledPatterns {
         error: patterns.error.iter().map(|p| compile_one(p)).collect(),
-        waiting_input: patterns.waiting_input.iter().map(|p| compile_one(p)).collect(),
+        waiting_input: patterns
+            .waiting_input
+            .iter()
+            .map(|p| compile_one(p))
+            .collect(),
         done: patterns.done.iter().map(|p| compile_one(p)).collect(),
         working: patterns.working.iter().map(|p| compile_one(p)).collect(),
     }
@@ -159,8 +163,8 @@ mod tests {
     /// Shared default config's `working` list. Read from the shipped config
     /// file when present so this stays honest as the config evolves.
     fn default_working_patterns() -> Vec<String> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("config/patterns.default.json");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/patterns.default.json");
         if let Ok(raw) = std::fs::read_to_string(&path) {
             let cfg: PatternConfig = serde_json::from_str(&raw).expect("default patterns parse");
             return cfg.working;

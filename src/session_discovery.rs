@@ -77,10 +77,7 @@ mod tests {
     #[test]
     fn supports_multiple_allowed_prefixes_for_a_single_profile() {
         let result = filter_sessions_for_profile(&sessions(), &strs(&["prod-", "ariel-"]));
-        assert_eq!(
-            result,
-            strs(&["prod-deploy", "prod-watch", "ariel-review"])
-        );
+        assert_eq!(result, strs(&["prod-deploy", "prod-watch", "ariel-review"]));
     }
 
     #[test]

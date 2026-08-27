@@ -110,7 +110,11 @@ pub fn run() -> i32 {
 fn package_root() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         for ancestor in exe.ancestors() {
-            if ancestor.join("config").join("default.config.json").is_file() {
+            if ancestor
+                .join("config")
+                .join("default.config.json")
+                .is_file()
+            {
                 return ancestor.to_path_buf();
             }
         }
@@ -261,7 +265,8 @@ fn cmd_watch(session: &str, profile: &str, agent: Option<&str>, dry_run: bool, o
         log_path.display()
     );
 
-    // We report crashes ourselves through the circuit breaker below.
+    // Only unexpected panics reach the circuit breaker below; expected
+    // capture-pane failures are emitted as normal decision events.
     std::panic::set_hook(Box::new(|_| {}));
 
     loop {
@@ -271,8 +276,10 @@ fn cmd_watch(session: &str, profile: &str, agent: Option<&str>, dry_run: bool, o
                     let line = serde_json::to_string(&event).unwrap_or_default();
                     if dry_run {
                         let dry_run_log = log_dir.join("dry-run-events.jsonl");
-                        if let Ok(mut file) =
-                            OpenOptions::new().create(true).append(true).open(&dry_run_log)
+                        if let Ok(mut file) = OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&dry_run_log)
                         {
                             let _ = writeln!(file, "{line}");
                         }
@@ -339,13 +346,7 @@ fn cmd_list_sessions(profile: &str, prefixes: Option<&str>) -> i32 {
     0
 }
 
-fn cmd_changelog_add(
-    profile: &str,
-    what: &str,
-    why: &str,
-    how: Option<&str>,
-    notify: bool,
-) -> i32 {
+fn cmd_changelog_add(profile: &str, what: &str, why: &str, how: Option<&str>, notify: bool) -> i32 {
     let profile_home = resolve_profile_home(profile);
     let log_dir = profile_home.join("logs");
     if let Err(err) = ensure_dir(&log_dir) {

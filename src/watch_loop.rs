@@ -4,7 +4,9 @@ use crate::log_store::append_with_rotation;
 use crate::rolling_context::RollingContextAccumulator;
 use crate::state_machine::SettleMachine;
 use crate::text_diff::diff_lines;
-use crate::types::{AutoRespondConfig, DecisionEvent, DecisionReason, PaneState, PollPhase, WatchDecideConfig};
+use crate::types::{
+    AutoRespondConfig, DecisionEvent, DecisionReason, PaneState, PollPhase, WatchDecideConfig,
+};
 use std::io;
 use std::path::PathBuf;
 use std::thread;
@@ -51,6 +53,7 @@ where
     rolling_context: RollingContextAccumulator,
     prev_content: Option<String>,
     pending_delta_lines: Vec<String>,
+    consecutive_capture_failures: u64,
     ms_since_last_event: u64,
     last_interval_ms: u64,
     auto_responder: AutoResponder,
@@ -71,8 +74,8 @@ where
         // Compilation errors are logged to stderr but never crash the watch loop;
         // the auto-responder falls back to always returning NoMatch when construction
         // fails (the ok_or fallback below creates a no-op responder via disabled config).
-        let auto_responder = AutoResponder::new(deps.auto_respond_config.clone())
-            .unwrap_or_else(|e| {
+        let auto_responder =
+            AutoResponder::new(deps.auto_respond_config.clone()).unwrap_or_else(|e| {
                 eprintln!("[tmux-watch] auto-respond config error (feature disabled): {e}");
                 AutoResponder::new(crate::types::AutoRespondConfig {
                     enabled: false,
@@ -94,6 +97,7 @@ where
             rolling_context,
             prev_content: None,
             pending_delta_lines: Vec::new(),
+            consecutive_capture_failures: 0,
             ms_since_last_event: 0,
             last_interval_ms: 0,
             auto_responder,
@@ -105,11 +109,7 @@ where
         if lines.is_empty() {
             return;
         }
-        let _ = append_with_rotation(
-            path,
-            &(lines.join("\n") + "\n"),
-            &self.config.log_rotation,
-        );
+        let _ = append_with_rotation(path, &(lines.join("\n") + "\n"), &self.config.log_rotation);
     }
 
     fn build_event(&mut self, state: PaneState, reason: DecisionReason) -> DecisionEvent {
@@ -135,10 +135,50 @@ where
         }
     }
 
+    fn build_capture_failure_event(&mut self, err: &io::Error) -> DecisionEvent {
+        self.pending_delta_lines.clear();
+        let message = format!("tmux capture failed: {err}");
+        DecisionEvent {
+            session: self.session.clone(),
+            state: PaneState::Error,
+            delta: message.clone(),
+            summary: message,
+            full_log_path: self.full_log_path.clone(),
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+            reason: DecisionReason::CaptureFailure,
+        }
+    }
+
     pub fn step(&mut self) -> WatchStepResult {
         self.ms_since_last_event += self.last_interval_ms;
 
-        let content = (self.capture_fn)().expect("tmux capture failed");
+        let content = match (self.capture_fn)() {
+            Ok(content) => {
+                self.consecutive_capture_failures = 0;
+                content
+            }
+            Err(err) => {
+                let threshold = u64::from(self.config.max_capture_failures.max(1));
+                self.consecutive_capture_failures += 1;
+                self.last_interval_ms = self.config.backoff.settling_ms;
+                if self.consecutive_capture_failures == threshold {
+                    let event = Some(self.build_capture_failure_event(&err));
+                    self.consecutive_capture_failures = 0;
+                    self.ms_since_last_event = 0;
+                    return WatchStepResult {
+                        interval_ms: self.last_interval_ms,
+                        event,
+                    };
+                }
+                return WatchStepResult {
+                    interval_ms: self.last_interval_ms,
+                    event: None,
+                };
+            }
+        };
         let mut changed = false;
 
         match &self.prev_content {
@@ -166,10 +206,7 @@ where
             let classification = classify(&delta_text, &self.patterns);
             if classification.state == PaneState::WaitingInput {
                 // ── auto-respond path ────────────────────────────────────────
-                let current_summary = self
-                    .rolling_context
-                    .peek_summary()
-                    .unwrap_or_default();
+                let current_summary = self.rolling_context.peek_summary().unwrap_or_default();
                 match self
                     .auto_responder
                     .decide(&delta_text, &current_summary, None)
@@ -177,8 +214,7 @@ where
                     AutoRespondDecision::ShouldFire { rule_index, keys } => {
                         // TOCTOU double-check: sleep `requireStableIdleMs`, re-capture,
                         // verify the match still holds before sending.
-                        let stable_ms =
-                            self.auto_responder.require_stable_idle_ms();
+                        let stable_ms = self.auto_responder.require_stable_idle_ms();
                         thread::sleep(Duration::from_millis(stable_ms));
                         let fresh = (self.capture_fn)().ok();
                         let still_matches = fresh
@@ -188,15 +224,11 @@ where
                         if still_matches {
                             match (self.send_keys_fn)(&keys) {
                                 Ok(()) => {
-                                    let changelog_path =
-                                        self.log_path.as_ref().map(|p| {
-                                            p.parent()
-                                                .unwrap_or(p)
-                                                .join("watch-decide-changelog.md")
-                                        });
-                                    let notify_telegram = self
-                                        .auto_responder
-                                        .telegram_on_every_auto_response();
+                                    let changelog_path = self.log_path.as_ref().map(|p| {
+                                        p.parent().unwrap_or(p).join("watch-decide-changelog.md")
+                                    });
+                                    let notify_telegram =
+                                        self.auto_responder.telegram_on_every_auto_response();
                                     let outcome = self.auto_responder.commit(
                                         rule_index,
                                         &keys,
@@ -241,7 +273,9 @@ where
                                 }
                                 Err(err) => {
                                     // send-keys failure → fall through to the LLM, never panic.
-                                    eprintln!("[tmux-watch] send-keys failed (routing to LLM): {err}");
+                                    eprintln!(
+                                        "[tmux-watch] send-keys failed (routing to LLM): {err}"
+                                    );
                                     event = Some(self.build_event(
                                         classification.state,
                                         DecisionReason::StateTransition,
@@ -257,16 +291,16 @@ where
                     }
                     AutoRespondDecision::Disabled | AutoRespondDecision::NoMatch => {
                         // Normal path: emit event to the decide loop.
-                        event = Some(self.build_event(
-                            classification.state,
-                            DecisionReason::StateTransition,
-                        ));
+                        event = Some(
+                            self.build_event(classification.state, DecisionReason::StateTransition),
+                        );
                         self.ms_since_last_event = 0;
                         self.pending_delta_lines.clear();
                     }
                 }
             } else if classification.state != PaneState::Working {
-                event = Some(self.build_event(classification.state, DecisionReason::StateTransition));
+                event =
+                    Some(self.build_event(classification.state, DecisionReason::StateTransition));
                 self.ms_since_last_event = 0;
                 self.pending_delta_lines.clear();
             } else {
@@ -275,8 +309,7 @@ where
         }
 
         if event.is_none() && self.ms_since_last_event >= self.config.safety_timeout_ms {
-            let classification =
-                classify(&self.pending_delta_lines.join("\n"), &self.patterns);
+            let classification = classify(&self.pending_delta_lines.join("\n"), &self.patterns);
             event = Some(self.build_event(classification.state, DecisionReason::SafetyTimeout));
             self.pending_delta_lines.clear();
             self.ms_since_last_event = 0;
@@ -293,7 +326,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auto_respond::AutoRespondDecision;
     use crate::classifier::compile_patterns;
     use crate::types::{
         AutoRespondConfig, AutoRespondLimits, AutoRespondNotify, AutoRespondRule, BackoffConfig,
@@ -318,6 +350,7 @@ mod tests {
                 settling_ms: 2000,
                 settled_ms: 3000,
             },
+            max_capture_failures: 3,
             rolling_context_every_n: 5,
             log_rotation: LogRotationConfig {
                 max_bytes: 10_000_000,
@@ -359,7 +392,30 @@ mod tests {
         }
     }
 
-    fn make_loop(frames: Vec<&str>) -> WatchLoop<impl FnMut() -> io::Result<String>, impl FnMut(&[String]) -> io::Result<()>> {
+    fn make_erroring_capture(results: Vec<io::Result<&str>>) -> impl FnMut() -> io::Result<String> {
+        assert!(
+            !results.is_empty(),
+            "test capture sequence must not be empty"
+        );
+        let results: Vec<io::Result<String>> = results
+            .into_iter()
+            .map(|result| result.map(String::from))
+            .collect();
+        let mut i = 0usize;
+        move || {
+            let idx = i.min(results.len() - 1);
+            i += 1;
+            match &results[idx] {
+                Ok(frame) => Ok(frame.clone()),
+                Err(err) => Err(io::Error::new(err.kind(), err.to_string())),
+            }
+        }
+    }
+
+    fn make_loop(
+        frames: Vec<&str>,
+    ) -> WatchLoop<impl FnMut() -> io::Result<String>, impl FnMut(&[String]) -> io::Result<()>>
+    {
         WatchLoop::new(WatchLoopDeps {
             session: "s1".to_string(),
             capture_fn: make_capture_queue(frames),
@@ -369,6 +425,129 @@ mod tests {
             auto_respond_config: disabled_auto_respond(),
             log_path: None,
         })
+    }
+
+    #[test]
+    fn capture_failure_emits_event_after_exact_threshold_without_panicking() {
+        let mut cfg = config();
+        cfg.max_capture_failures = 3;
+        let mut l = WatchLoop::new(WatchLoopDeps {
+            session: "s1".to_string(),
+            capture_fn: make_erroring_capture(vec![
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+            ]),
+            send_keys_fn: |_: &[String]| Ok(()),
+            patterns: compile_patterns(&patterns()),
+            config: cfg,
+            auto_respond_config: disabled_auto_respond(),
+            log_path: None,
+        });
+
+        let r1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| l.step()));
+        let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| l.step()));
+        let r3 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| l.step()));
+
+        assert!(r1.is_ok());
+        assert!(r2.is_ok());
+        let event = r3.unwrap().event.expect("threshold should emit event");
+        assert_eq!(event.state, PaneState::Error);
+        assert_eq!(event.reason, DecisionReason::CaptureFailure);
+        assert!(event.delta.contains("pane missing"));
+        assert!(event.summary.contains("pane missing"));
+    }
+
+    #[test]
+    fn capture_failure_below_threshold_emits_nothing_and_uses_short_interval() {
+        let mut cfg = config();
+        cfg.max_capture_failures = 3;
+        let mut l = WatchLoop::new(WatchLoopDeps {
+            session: "s1".to_string(),
+            capture_fn: make_erroring_capture(vec![
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+            ]),
+            send_keys_fn: |_: &[String]| Ok(()),
+            patterns: compile_patterns(&patterns()),
+            config: cfg,
+            auto_respond_config: disabled_auto_respond(),
+            log_path: None,
+        });
+
+        let r1 = l.step();
+        let r2 = l.step();
+
+        assert!(r1.event.is_none());
+        assert!(r2.event.is_none());
+        assert_eq!(r1.interval_ms, 2000);
+        assert_eq!(r2.interval_ms, 2000);
+    }
+
+    #[test]
+    fn successful_capture_resets_consecutive_failure_counter() {
+        let mut cfg = config();
+        cfg.max_capture_failures = 3;
+        let mut l = WatchLoop::new(WatchLoopDeps {
+            session: "s1".to_string(),
+            capture_fn: make_erroring_capture(vec![
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Ok("● working again"),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+            ]),
+            send_keys_fn: |_: &[String]| Ok(()),
+            patterns: compile_patterns(&patterns()),
+            config: cfg,
+            auto_respond_config: disabled_auto_respond(),
+            log_path: None,
+        });
+
+        assert!(l.step().event.is_none());
+        assert!(l.step().event.is_none());
+        assert!(l.step().event.is_none());
+        assert!(l.step().event.is_none());
+        let r5 = l.step();
+        assert!(r5.event.is_none());
+        assert_eq!(r5.interval_ms, 2000);
+        let r6 = l.step();
+        assert!(matches!(
+            r6.event.as_ref().map(|event| event.reason),
+            Some(DecisionReason::CaptureFailure)
+        ));
+    }
+
+    #[test]
+    fn repeated_capture_failure_episodes_emit_again_after_reset() {
+        let mut cfg = config();
+        cfg.max_capture_failures = 2;
+        let mut l = WatchLoop::new(WatchLoopDeps {
+            session: "s1".to_string(),
+            capture_fn: make_erroring_capture(vec![
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+                Err(io::Error::new(io::ErrorKind::NotFound, "pane missing")),
+            ]),
+            send_keys_fn: |_: &[String]| Ok(()),
+            patterns: compile_patterns(&patterns()),
+            config: cfg,
+            auto_respond_config: disabled_auto_respond(),
+            log_path: None,
+        });
+
+        assert!(l.step().event.is_none());
+        assert!(matches!(
+            l.step().event.as_ref().map(|event| event.reason),
+            Some(DecisionReason::CaptureFailure)
+        ));
+        assert!(l.step().event.is_none());
+        assert!(matches!(
+            l.step().event.as_ref().map(|event| event.reason),
+            Some(DecisionReason::CaptureFailure)
+        ));
     }
 
     #[test]
@@ -528,7 +707,7 @@ mod tests {
         l.step(); // settling
 
         let r = l.step(); // settled
-        // Should have emitted an AutoResponded event (emit_event_to_decide_loop: true).
+                          // Should have emitted an AutoResponded event (emit_event_to_decide_loop: true).
         let event = r.event.expect("event emitted");
         assert_eq!(event.state, PaneState::WaitingInput);
         assert!(matches!(event.reason, DecisionReason::AutoResponded));
@@ -604,9 +783,7 @@ mod tests {
         let mut l = WatchLoop::new(WatchLoopDeps {
             session: "s1".to_string(),
             capture_fn,
-            send_keys_fn: |_: &[String]| {
-                Err(io::Error::other("simulated send-keys failure"))
-            },
+            send_keys_fn: |_: &[String]| Err(io::Error::other("simulated send-keys failure")),
             patterns: compile_patterns(&patterns()),
             config: config(),
             auto_respond_config: auto_respond_config_with_safe_rule(r"❯\s*\d+\."),

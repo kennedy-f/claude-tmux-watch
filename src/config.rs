@@ -23,8 +23,8 @@ fn deep_merge(base: Value, override_val: Value) -> Value {
 }
 
 fn load_json(path: &Path) -> anyhow::Result<Value> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
@@ -121,8 +121,11 @@ mod tests {
             r#"{"error":["A"],"waiting_input":["W"],"done":[],"working":[]}"#,
         );
         let preset = write(dir.path(), "codex.json", r#"{"waiting_input":["CODEX_W"]}"#);
-        let override_path =
-            write(dir.path(), "profile.json", r#"{"waiting_input":["PROFILE_W"]}"#);
+        let override_path = write(
+            dir.path(),
+            "profile.json",
+            r#"{"waiting_input":["PROFILE_W"]}"#,
+        );
         let result =
             load_patterns_layered(&default_path, &[Some(&preset), Some(&override_path)]).unwrap();
         assert_eq!(result.waiting_input, vec!["PROFILE_W".to_string()]);
@@ -139,5 +142,34 @@ mod tests {
         let missing = dir.path().join("does-not-exist.json");
         let result = load_patterns_layered(&default_path, &[Some(&missing), None]).unwrap();
         assert_eq!(result.error, vec!["A".to_string()]);
+    }
+
+    #[test]
+    fn load_config_uses_default_max_capture_failures_and_allows_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_path = write(
+            dir.path(),
+            "default.config.json",
+            r#"{
+                "settleWindowMs": 4000,
+                "backoff": {"workingMs": 12000, "settlingMs": 2000, "settledMs": 3000},
+                "rollingContextEveryN": 5,
+                "logRotation": {"maxBytes": 5242880, "maxFiles": 5},
+                "safetyTimeoutMs": 1500000,
+                "circuitBreaker": {"maxCrashes": 3, "windowMs": 600000},
+                "telegramNotifyOnAutoImprove": true
+            }"#,
+        );
+        let override_path = write(
+            dir.path(),
+            "override.config.json",
+            r#"{"maxCaptureFailures": 7}"#,
+        );
+
+        let default_cfg = load_config(&default_path, None).unwrap();
+        let override_cfg = load_config(&default_path, Some(&override_path)).unwrap();
+
+        assert_eq!(default_cfg.max_capture_failures, 3);
+        assert_eq!(override_cfg.max_capture_failures, 7);
     }
 }
