@@ -18,6 +18,7 @@ const DEFAULT_HOW_TO_REPLICATE: &str = "Apply the same change to config/patterns
 #[derive(Parser)]
 #[command(
     name = "tmux-watch",
+    version,
     about = "Deterministic watch/decide split for Hermes<->Claude Code tmux orchestration",
     disable_help_subcommand = true
 )]

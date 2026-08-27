@@ -1,6 +1,6 @@
 [package]
 name = "tmux-watch"
-version = "1.0.0"
+version = "0.2.0"
 edition = "2021"
 description = "Deterministic watch/decide split for tmux-driven coding agents"
 
