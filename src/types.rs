@@ -91,6 +91,69 @@ pub struct DeltaResult {
 pub enum DecisionReason {
     StateTransition,
     SafetyTimeout,
+    /// Emitted when the watch loop answered a `waiting_input` prompt itself via
+    /// `tmux send-keys` without calling the LLM. The `summary` field of the
+    /// accompanying `DecisionEvent` includes the rule id and the keys sent.
+    AutoResponded,
+}
+
+// ── auto-respond config types ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuleRisk {
+    /// Execute directly when `match` hits the delta.
+    Safe,
+    /// Execute only when `match` hits the delta AND a `requiresContextAllow`
+    /// regex hits the rolling summary.
+    Confirm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoRespondRule {
+    pub id: String,
+    /// Regex applied to the settled delta (multiline forced, same as classifier).
+    #[serde(rename = "match")]
+    pub match_pattern: String,
+    /// argv sequence passed to `tmux send-keys`.
+    pub keys: Vec<String>,
+    pub risk: RuleRisk,
+    /// Required for `confirm` rules: at least one must match the rolling summary.
+    #[serde(default)]
+    pub requires_context_allow: Vec<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoRespondLimits {
+    pub max_auto_responses_per_session: usize,
+    pub max_auto_responses_per_rule_per_hour: usize,
+    pub cooldown_ms_after_response: u128,
+    pub require_stable_idle_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoRespondNotify {
+    pub telegram_on_every_auto_response: bool,
+    pub emit_event_to_decide_loop: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoRespondConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub rules: Vec<AutoRespondRule>,
+    pub limits: AutoRespondLimits,
+    pub notify: AutoRespondNotify,
 }
 
 #[derive(Debug, Clone, Serialize)]

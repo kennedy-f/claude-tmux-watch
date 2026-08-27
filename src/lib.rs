@@ -9,6 +9,7 @@ pub mod circuit_breaker;
 pub mod session_discovery;
 pub mod changelog;
 pub mod tmux;
+pub mod auto_respond;
 pub mod watch_loop;
 pub mod dry_run;
 pub mod measurement;

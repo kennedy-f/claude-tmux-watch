@@ -42,6 +42,16 @@ impl RollingContextAccumulator {
             compacted: false,
         }
     }
+
+    /// Returns the current rolling window concatenated as a summary without
+    /// advancing the counter — used by auto-respond's context-allow check.
+    pub fn peek_summary(&self) -> Option<String> {
+        if self.window_texts.is_empty() {
+            None
+        } else {
+            Some(self.window_texts.join("\n"))
+        }
+    }
 }
 
 #[cfg(test)]

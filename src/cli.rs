@@ -1,9 +1,10 @@
+use crate::auto_respond::load_auto_respond_config;
 use crate::changelog::{append_changelog_entry, notify_via_hermes_send, ChangelogEntry};
 use crate::circuit_breaker::CircuitBreaker;
 use crate::classifier::compile_patterns;
 use crate::config::{load_config, load_patterns_layered};
 use crate::session_discovery::{filter_sessions_for_profile, parse_tmux_list_sessions};
-use crate::tmux::{capture_pane, list_sessions};
+use crate::tmux::{capture_pane, list_sessions, send_keys};
 use crate::watch_loop::{WatchLoop, WatchLoopDeps};
 use clap::{Parser, Subcommand};
 use std::fs::{self, OpenOptions};
@@ -209,6 +210,18 @@ fn cmd_watch(session: &str, profile: &str, agent: Option<&str>, dry_run: bool, o
         }
     };
 
+    let auto_respond_override = profile_home.join("tmux-watch.auto-respond.json");
+    let auto_respond_config = match load_auto_respond_config(
+        &root.join("config").join("auto-respond.default.json"),
+        Some(&auto_respond_override),
+    ) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("[tmux-watch] failed to load auto-respond config: {err:#}");
+            return 1;
+        }
+    };
+
     let pattern_source = match load_patterns_layered(
         &root.join("config").join("patterns.default.json"),
         &[agent_preset.as_deref(), Some(&patterns_override)],
@@ -232,11 +245,14 @@ fn cmd_watch(session: &str, profile: &str, agent: Option<&str>, dry_run: bool, o
     let working_backoff = Duration::from_millis(config.backoff.working_ms);
 
     let owned_session = session.to_string();
+    let owned_session2 = session.to_string();
     let mut watch = WatchLoop::new(WatchLoopDeps {
         session: session.to_string(),
         capture_fn: move || capture_pane(&owned_session),
+        send_keys_fn: move |keys: &[String]| send_keys(&owned_session2, keys),
         patterns,
         config,
+        auto_respond_config,
         log_path: Some(log_path.clone()),
     });
 
