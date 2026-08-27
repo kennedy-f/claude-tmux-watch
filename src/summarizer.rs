@@ -93,7 +93,10 @@ mod tests {
     #[test]
     fn extracts_file_paths_with_known_source_extensions() {
         let text = "Edited src/app.ts and docs/README.md, skipped node_modules noise.";
-        assert_eq!(extract_file_paths(text), vec!["src/app.ts", "docs/README.md"]);
+        assert_eq!(
+            extract_file_paths(text),
+            vec!["src/app.ts", "docs/README.md"]
+        );
     }
 
     #[test]

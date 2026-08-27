@@ -23,8 +23,8 @@ fn deep_merge(base: Value, override_val: Value) -> Value {
 }
 
 fn load_json(path: &Path) -> anyhow::Result<Value> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
@@ -64,6 +64,15 @@ pub fn load_patterns_layered(
 ) -> anyhow::Result<PatternConfig> {
     let merged = load_layered_value(default_path, layer_paths)?;
     Ok(serde_json::from_value(merged)?)
+}
+
+/// Returns the merged `Value` for auto-respond config (caller converts to typed struct).
+/// Public for use by `auto_respond.rs`.
+pub fn load_auto_respond_value(
+    default_path: &Path,
+    override_path: Option<&Path>,
+) -> anyhow::Result<serde_json::Value> {
+    load_layered_value(default_path, &[override_path])
 }
 
 #[cfg(test)]
@@ -112,8 +121,11 @@ mod tests {
             r#"{"error":["A"],"waiting_input":["W"],"done":[],"working":[]}"#,
         );
         let preset = write(dir.path(), "codex.json", r#"{"waiting_input":["CODEX_W"]}"#);
-        let override_path =
-            write(dir.path(), "profile.json", r#"{"waiting_input":["PROFILE_W"]}"#);
+        let override_path = write(
+            dir.path(),
+            "profile.json",
+            r#"{"waiting_input":["PROFILE_W"]}"#,
+        );
         let result =
             load_patterns_layered(&default_path, &[Some(&preset), Some(&override_path)]).unwrap();
         assert_eq!(result.waiting_input, vec!["PROFILE_W".to_string()]);

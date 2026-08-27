@@ -37,9 +37,38 @@ pub fn capture_pane(session: &str) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Builds the argv array for `tmux send-keys`. Arguments are passed through
+/// an argv array so a session name can never be interpreted as shell syntax.
+pub fn build_send_keys_args(session: &str, keys: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "send-keys".to_string(),
+        "-t".to_string(),
+        session.to_string(),
+    ];
+    args.extend_from_slice(keys);
+    args
+}
+
+/// Sends key strokes to the target tmux pane. Uses an argv array (no shell).
+pub fn send_keys(session: &str, keys: &[String]) -> io::Result<()> {
+    let output = Command::new("tmux")
+        .args(build_send_keys_args(session, keys))
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "tmux send-keys failed for {session}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 /// Returns "" when tmux exits non-zero (server not running / no sessions).
 pub fn list_sessions() -> String {
-    match Command::new("tmux").args(build_list_sessions_args()).output() {
+    match Command::new("tmux")
+        .args(build_list_sessions_args())
+        .output()
+    {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).into_owned()
         }
@@ -50,6 +79,23 @@ pub fn list_sessions() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_keys_args_never_use_shell_expansion() {
+        let session = "work-backend; rm -rf /";
+        let keys = vec!["1".to_string(), "Enter".to_string()];
+        let args = build_send_keys_args(session, &keys);
+        let t_index = args.iter().position(|a| a == "-t").expect("-t present");
+        assert_eq!(args[t_index + 1], session);
+        assert!(args.contains(&"1".to_string()));
+        assert!(args.contains(&"Enter".to_string()));
+    }
+
+    #[test]
+    fn send_keys_args_start_with_send_keys() {
+        let args = build_send_keys_args("s", &["y".to_string()]);
+        assert_eq!(args[0], "send-keys");
+    }
 
     #[test]
     fn capture_args_use_p_and_j_and_never_e() {

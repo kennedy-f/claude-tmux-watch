@@ -20,7 +20,10 @@ pub fn append_with_rotation(
         return Ok(());
     }
 
-    let mut file = OpenOptions::new().create(true).append(true).open(log_path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
     file.write_all(content.as_bytes())
 }
 

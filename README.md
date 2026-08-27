@@ -298,6 +298,77 @@ loop:
 tool execution stays exactly where it already was (Hermes/Claude Code);
 only the *timing* of when to bother the LLM at all has changed.
 
+## Auto-respond (zero-LLM replies to known prompts)
+
+Today every `waiting_input` decision event wakes the orchestrator's LLM. In practice 60–80% of prompts from a coding agent (Claude Code trust-folder, repeated command-permission prompts, `(y/n)` build/test confirmations) are trivial and repetitive. If a prompt pattern is **pre-approved by the operator**, the watch loop itself answers via `tmux send-keys` and never calls the LLM — **zero tokens** for that event. The orchestrator learns about it afterwards via a cheap `{"reason":"auto_responded",...}` informational event.
+
+### Schema
+
+Create `<profile-home>/tmux-watch.auto-respond.json` to enable and configure rules. It deep-merges over the shipped `config/auto-respond.default.json` (which ships with `"enabled": false` and no rules — deny-by-default):
+
+```json
+{
+  "enabled": true,
+  "rules": [
+    {
+      "id": "claude-code-trust-folder",
+      "match": "Do you trust the files in this folder\\?",
+      "keys": ["1", "Enter"],
+      "risk": "safe"
+    },
+    {
+      "id": "yn-build-test",
+      "match": "\\(y/n\\)\\s*$",
+      "keys": ["y", "Enter"],
+      "risk": "confirm",
+      "requiresContextAllow": ["cargo build", "cargo test", "npm install"]
+    }
+  ]
+}
+```
+
+**Rule fields:**
+
+| field | semantics |
+|---|---|
+| `id` | stable identity for logs, changelog, rate limiting |
+| `match` | regex (multiline forced) applied **only** to the settled delta that classified `waiting_input` |
+| `keys` | argv sequence for `tmux send-keys` (e.g. `["1", "Enter"]`) |
+| `risk` | `"safe"` → execute directly; `"confirm"` → execute ONLY if `requiresContextAllow` also matches the rolling summary |
+| `requiresContextAllow` | (`confirm` only) at least one regex must match the rolling summary — an allowlist of safe command contexts |
+| `enabled` | optional, default `true` |
+
+**Limits (per-profile, deep-merged):**
+
+```json
+"limits": {
+  "maxAutoResponsesPerSession": 20,
+  "maxAutoResponsesPerRulePerHour": 10,
+  "cooldownMsAfterResponse": 5000,
+  "requireStableIdleMs": 2000
+}
+```
+
+### Safety invariants
+
+1. **State guard.** Auto-respond only ever runs after settle AND after classification returns `waiting_input`. Never on `working`/`done`/`error`, never on a partial delta.
+2. **`confirm` double check.** `confirm` rules require BOTH: `match` hits the delta AND a `requiresContextAllow` regex hits the current rolling summary. Without a matching context, the event falls through to the normal LLM call.
+3. **TOCTOU re-capture.** Between classify and send-keys, the watch loop sleeps `requireStableIdleMs`, re-captures the pane, and verifies `match` still hits the fresh content. If the content has changed, it aborts silently and resumes the loop — no keys are sent.
+4. **Hard rate limits.** Per-session total and per-rule-per-hour caps. When exceeded, the rule is suspended for the session and the event is routed to the LLM normally (fail-open to the human). The suspension is logged to the changelog.
+5. **Cooldown.** After any send-keys, no auto-respond fires for `cooldownMsAfterResponse` (avoids reacting to the echo of the response).
+6. **Chrome regression guard.** A rule whose `match` regex hits a persistent status-bar chrome line is rejected at compile time — it will never be added to the active rule set.
+7. **Full audit trail.** Every auto-response produces: (a) a structured changelog entry, (b) a line in the raw session log, (c) if `notify.emitEventToDecideLoop` is `true`, a `DecisionEvent` with `reason: "auto_responded"` whose summary contains the rule id and keys sent.
+
+> ⚠️ **Warning.** `confirm` rules that do not specify `requiresContextAllow` effectively behave like `safe` rules because the empty allowlist check passes vacuously. Never use `confirm` without `requiresContextAllow` for prompts that could precede destructive operations (file deletion, force-push, etc.). When in doubt, prefer the LLM path over a `safe` rule.
+
+### Shipped examples
+
+See `config/auto-respond.example.json` for two commented examples:
+- **Claude Code trust-folder** (`safe`) — answers `1 Enter` to the folder-trust prompt.
+- **`(y/n)` build confirmation** (`confirm`) — answers `y Enter` only when the rolling context confirms the current command is `cargo build`, `cargo test`, or `npm install`.
+
+Both are disabled by default (`"enabled": false`).
+
 ## Development
 
 ```
