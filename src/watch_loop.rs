@@ -1,18 +1,26 @@
+use crate::auto_respond::{AutoRespondDecision, AutoResponder};
 use crate::classifier::{classify, CompiledPatterns};
 use crate::log_store::append_with_rotation;
 use crate::rolling_context::RollingContextAccumulator;
 use crate::state_machine::SettleMachine;
 use crate::text_diff::diff_lines;
-use crate::types::{DecisionEvent, DecisionReason, PaneState, PollPhase, WatchDecideConfig};
+use crate::types::{AutoRespondConfig, DecisionEvent, DecisionReason, PaneState, PollPhase, WatchDecideConfig};
 use std::io;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub struct WatchLoopDeps<F: FnMut() -> io::Result<String>> {
+pub struct WatchLoopDeps<F, S>
+where
+    F: FnMut() -> io::Result<String>,
+    S: FnMut(&[String]) -> io::Result<()>,
+{
     pub session: String,
     pub capture_fn: F,
+    pub send_keys_fn: S,
     pub patterns: CompiledPatterns,
     pub config: WatchDecideConfig,
+    pub auto_respond_config: AutoRespondConfig,
     /// Full path to the raw persistence log for this session. Optional for pure unit testing.
     pub log_path: Option<PathBuf>,
 }
@@ -27,9 +35,14 @@ pub struct WatchStepResult {
 /// classifies only the new delta, and runs it through the settle/backoff
 /// state machine. A DecisionEvent is only produced on a confirmed real
 /// transition (waiting_input/done/error) or a safety-timeout check-in.
-pub struct WatchLoop<F: FnMut() -> io::Result<String>> {
+pub struct WatchLoop<F, S>
+where
+    F: FnMut() -> io::Result<String>,
+    S: FnMut(&[String]) -> io::Result<()>,
+{
     session: String,
     capture_fn: F,
+    send_keys_fn: S,
     patterns: CompiledPatterns,
     config: WatchDecideConfig,
     log_path: Option<PathBuf>,
@@ -40,19 +53,39 @@ pub struct WatchLoop<F: FnMut() -> io::Result<String>> {
     pending_delta_lines: Vec<String>,
     ms_since_last_event: u64,
     last_interval_ms: u64,
+    auto_responder: AutoResponder,
 }
 
-impl<F: FnMut() -> io::Result<String>> WatchLoop<F> {
-    pub fn new(deps: WatchLoopDeps<F>) -> Self {
+impl<F, S> WatchLoop<F, S>
+where
+    F: FnMut() -> io::Result<String>,
+    S: FnMut(&[String]) -> io::Result<()>,
+{
+    pub fn new(deps: WatchLoopDeps<F, S>) -> Self {
         let machine = SettleMachine::new(deps.config.backoff, deps.config.settle_window_ms);
         let rolling_context = RollingContextAccumulator::new(deps.config.rolling_context_every_n);
         let full_log_path = match &deps.log_path {
             Some(p) => p.display().to_string(),
             None => format!("~/.hermes/logs/tmux-{}.log", deps.session),
         };
+        // Compilation errors are logged to stderr but never crash the watch loop;
+        // the auto-responder falls back to always returning NoMatch when construction
+        // fails (the ok_or fallback below creates a no-op responder via disabled config).
+        let auto_responder = AutoResponder::new(deps.auto_respond_config.clone())
+            .unwrap_or_else(|e| {
+                eprintln!("[tmux-watch] auto-respond config error (feature disabled): {e}");
+                AutoResponder::new(crate::types::AutoRespondConfig {
+                    enabled: false,
+                    rules: vec![],
+                    limits: deps.auto_respond_config.limits.clone(),
+                    notify: deps.auto_respond_config.notify.clone(),
+                })
+                .expect("fallback disabled config always valid")
+            });
         Self {
             session: deps.session,
             capture_fn: deps.capture_fn,
+            send_keys_fn: deps.send_keys_fn,
             patterns: deps.patterns,
             config: deps.config,
             log_path: deps.log_path,
@@ -63,6 +96,7 @@ impl<F: FnMut() -> io::Result<String>> WatchLoop<F> {
             pending_delta_lines: Vec::new(),
             ms_since_last_event: 0,
             last_interval_ms: 0,
+            auto_responder,
         }
     }
 
@@ -128,13 +162,116 @@ impl<F: FnMut() -> io::Result<String>> WatchLoop<F> {
         let mut event: Option<DecisionEvent> = None;
 
         if just_settled {
-            let classification =
-                classify(&self.pending_delta_lines.join("\n"), &self.patterns);
-            if classification.state != PaneState::Working {
+            let delta_text = self.pending_delta_lines.join("\n");
+            let classification = classify(&delta_text, &self.patterns);
+            if classification.state == PaneState::WaitingInput {
+                // ── auto-respond path ────────────────────────────────────────
+                let current_summary = self
+                    .rolling_context
+                    .peek_summary()
+                    .unwrap_or_default();
+                match self
+                    .auto_responder
+                    .decide(&delta_text, &current_summary, None)
+                {
+                    AutoRespondDecision::ShouldFire { rule_index, keys } => {
+                        // TOCTOU double-check: sleep `requireStableIdleMs`, re-capture,
+                        // verify the match still holds before sending.
+                        let stable_ms =
+                            self.auto_responder.require_stable_idle_ms();
+                        thread::sleep(Duration::from_millis(stable_ms));
+                        let fresh = (self.capture_fn)().ok();
+                        let still_matches = fresh
+                            .as_deref()
+                            .map(|c| self.auto_responder.rule_still_matches(rule_index, c))
+                            .unwrap_or(false);
+                        if still_matches {
+                            match (self.send_keys_fn)(&keys) {
+                                Ok(()) => {
+                                    let changelog_path =
+                                        self.log_path.as_ref().map(|p| {
+                                            p.parent()
+                                                .unwrap_or(p)
+                                                .join("watch-decide-changelog.md")
+                                        });
+                                    let notify_telegram = self
+                                        .auto_responder
+                                        .telegram_on_every_auto_response();
+                                    let outcome = self.auto_responder.commit(
+                                        rule_index,
+                                        &keys,
+                                        changelog_path.as_deref(),
+                                        notify_telegram,
+                                        None,
+                                    );
+                                    // Raw session log entry.
+                                    self.persist_raw(&[format!(
+                                        "[auto-respond] rule={} keys={}",
+                                        outcome.rule_id,
+                                        keys.join(" ")
+                                    )]);
+                                    // Emit event to decide loop if configured.
+                                    if self.auto_responder.emit_event_to_decide_loop() {
+                                        let summary = format!(
+                                            "auto_responded: rule={} keys={}",
+                                            outcome.rule_id,
+                                            keys.join(" ")
+                                        );
+                                        let ev = DecisionEvent {
+                                            session: self.session.clone(),
+                                            state: PaneState::WaitingInput,
+                                            delta: format!(
+                                                "+{} lines since last capture",
+                                                self.pending_delta_lines.len()
+                                            ),
+                                            summary,
+                                            full_log_path: self.full_log_path.clone(),
+                                            timestamp_ms: SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .map(|d| d.as_millis())
+                                                .unwrap_or(0),
+                                            reason: DecisionReason::AutoResponded,
+                                        };
+                                        self.pending_delta_lines.clear();
+                                        event = Some(ev);
+                                        self.ms_since_last_event = 0;
+                                    } else {
+                                        self.pending_delta_lines.clear();
+                                    }
+                                }
+                                Err(err) => {
+                                    // send-keys failure → fall through to the LLM, never panic.
+                                    eprintln!("[tmux-watch] send-keys failed (routing to LLM): {err}");
+                                    event = Some(self.build_event(
+                                        classification.state,
+                                        DecisionReason::StateTransition,
+                                    ));
+                                    self.ms_since_last_event = 0;
+                                    self.pending_delta_lines.clear();
+                                }
+                            }
+                        } else {
+                            // TOCTOU check failed: content changed — abort silently and resume.
+                            self.pending_delta_lines.clear();
+                        }
+                    }
+                    AutoRespondDecision::Disabled | AutoRespondDecision::NoMatch => {
+                        // Normal path: emit event to the decide loop.
+                        event = Some(self.build_event(
+                            classification.state,
+                            DecisionReason::StateTransition,
+                        ));
+                        self.ms_since_last_event = 0;
+                        self.pending_delta_lines.clear();
+                    }
+                }
+            } else if classification.state != PaneState::Working {
                 event = Some(self.build_event(classification.state, DecisionReason::StateTransition));
                 self.ms_since_last_event = 0;
+                self.pending_delta_lines.clear();
+            } else {
+                self.pending_delta_lines.clear();
             }
-            self.pending_delta_lines.clear();
         }
 
         if event.is_none() && self.ms_since_last_event >= self.config.safety_timeout_ms {
@@ -156,10 +293,13 @@ impl<F: FnMut() -> io::Result<String>> WatchLoop<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auto_respond::AutoRespondDecision;
     use crate::classifier::compile_patterns;
     use crate::types::{
-        BackoffConfig, CircuitBreakerConfig, LogRotationConfig, PatternConfig,
+        AutoRespondConfig, AutoRespondLimits, AutoRespondNotify, AutoRespondRule, BackoffConfig,
+        CircuitBreakerConfig, LogRotationConfig, PatternConfig, RuleRisk,
     };
+    use std::sync::{Arc, Mutex};
 
     fn patterns() -> PatternConfig {
         PatternConfig {
@@ -192,6 +332,23 @@ mod tests {
         }
     }
 
+    fn disabled_auto_respond() -> AutoRespondConfig {
+        AutoRespondConfig {
+            enabled: false,
+            rules: vec![],
+            limits: AutoRespondLimits {
+                max_auto_responses_per_session: 20,
+                max_auto_responses_per_rule_per_hour: 10,
+                cooldown_ms_after_response: 5000,
+                require_stable_idle_ms: 0, // 0 for tests to avoid sleeping
+            },
+            notify: AutoRespondNotify {
+                telegram_on_every_auto_response: false,
+                emit_event_to_decide_loop: true,
+            },
+        }
+    }
+
     fn make_capture_queue(frames: Vec<&str>) -> impl FnMut() -> io::Result<String> {
         let frames: Vec<String> = frames.into_iter().map(String::from).collect();
         let mut i = 0usize;
@@ -202,12 +359,14 @@ mod tests {
         }
     }
 
-    fn make_loop(frames: Vec<&str>) -> WatchLoop<impl FnMut() -> io::Result<String>> {
+    fn make_loop(frames: Vec<&str>) -> WatchLoop<impl FnMut() -> io::Result<String>, impl FnMut(&[String]) -> io::Result<()>> {
         WatchLoop::new(WatchLoopDeps {
             session: "s1".to_string(),
             capture_fn: make_capture_queue(frames),
+            send_keys_fn: |_: &[String]| Ok(()),
             patterns: compile_patterns(&patterns()),
             config: config(),
+            auto_respond_config: disabled_auto_respond(),
             log_path: None,
         })
     }
@@ -284,5 +443,183 @@ mod tests {
             }
         }
         assert!(saw_timeout_event);
+    }
+
+    // ── auto-respond integration tests ────────────────────────────────────────
+
+    fn auto_respond_config_with_safe_rule(match_pattern: &str) -> AutoRespondConfig {
+        AutoRespondConfig {
+            enabled: true,
+            rules: vec![AutoRespondRule {
+                id: "test-safe".to_string(),
+                match_pattern: match_pattern.to_string(),
+                keys: vec!["1".to_string(), "Enter".to_string()],
+                risk: RuleRisk::Safe,
+                requires_context_allow: vec![],
+                enabled: true,
+            }],
+            limits: AutoRespondLimits {
+                max_auto_responses_per_session: 20,
+                max_auto_responses_per_rule_per_hour: 10,
+                cooldown_ms_after_response: 5000,
+                require_stable_idle_ms: 0,
+            },
+            notify: AutoRespondNotify {
+                telegram_on_every_auto_response: false,
+                emit_event_to_decide_loop: true,
+            },
+        }
+    }
+
+    #[test]
+    fn disabled_auto_respond_config_is_identical_to_today() {
+        // With disabled config, a waiting_input event is emitted normally.
+        let frames = vec![
+            "● working on it",
+            "● working on it\n❯ 1. Proceed?",
+            "● working on it\n❯ 1. Proceed?",
+            "● working on it\n❯ 1. Proceed?",
+        ];
+        let mut l = make_loop(frames);
+        l.step();
+        l.step();
+        l.step();
+        let r = l.step();
+        let event = r.event.expect("event emitted");
+        assert_eq!(event.state, PaneState::WaitingInput);
+        assert!(matches!(event.reason, DecisionReason::StateTransition));
+    }
+
+    #[test]
+    fn safe_rule_match_sends_keys_and_emits_auto_responded_event() {
+        let sent_keys: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(vec![]));
+        let sent_clone = Arc::clone(&sent_keys);
+
+        let frames: Vec<String> = vec![
+            "● working on it".to_string(),
+            "● working on it\n❯ 1. Proceed?".to_string(),
+            "● working on it\n❯ 1. Proceed?".to_string(),
+            // Extra frame returned by TOCTOU re-capture (same content = still matches).
+            "● working on it\n❯ 1. Proceed?".to_string(),
+        ];
+        let mut fi = 0usize;
+        let frames_cap = frames.clone();
+        let capture_fn = move || {
+            let idx = fi.min(frames_cap.len() - 1);
+            fi += 1;
+            Ok(frames_cap[idx].clone())
+        };
+
+        let mut l = WatchLoop::new(WatchLoopDeps {
+            session: "s1".to_string(),
+            capture_fn,
+            send_keys_fn: move |keys: &[String]| {
+                sent_clone.lock().unwrap().push(keys.to_vec());
+                Ok(())
+            },
+            patterns: compile_patterns(&patterns()),
+            config: config(),
+            auto_respond_config: auto_respond_config_with_safe_rule(r"❯\s*\d+\."),
+            log_path: None,
+        });
+
+        l.step(); // init
+        l.step(); // change detected
+        l.step(); // settling
+
+        let r = l.step(); // settled
+        // Should have emitted an AutoResponded event (emit_event_to_decide_loop: true).
+        let event = r.event.expect("event emitted");
+        assert_eq!(event.state, PaneState::WaitingInput);
+        assert!(matches!(event.reason, DecisionReason::AutoResponded));
+        assert!(event.summary.contains("test-safe"));
+
+        // Keys were sent via the injected mock.
+        let keys_sent = sent_keys.lock().unwrap();
+        assert_eq!(keys_sent.len(), 1);
+        assert_eq!(keys_sent[0], vec!["1", "Enter"]);
+    }
+
+    #[test]
+    fn toctou_abort_when_content_changes_between_classify_and_recheck() {
+        // The TOCTOU re-capture returns different content that no longer matches.
+        let frames: Vec<String> = vec![
+            "● working on it".to_string(),
+            "● working on it\n❯ 1. Proceed?".to_string(),
+            "● working on it\n❯ 1. Proceed?".to_string(),
+            // TOCTOU re-capture frame: prompt is gone.
+            "● working on something else entirely".to_string(),
+        ];
+        let sent_keys: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(vec![]));
+        let sent_clone = Arc::clone(&sent_keys);
+        let mut fi = 0usize;
+        let frames_cap = frames.clone();
+        let capture_fn = move || {
+            let idx = fi.min(frames_cap.len() - 1);
+            fi += 1;
+            Ok(frames_cap[idx].clone())
+        };
+
+        let mut l = WatchLoop::new(WatchLoopDeps {
+            session: "s1".to_string(),
+            capture_fn,
+            send_keys_fn: move |keys: &[String]| {
+                sent_clone.lock().unwrap().push(keys.to_vec());
+                Ok(())
+            },
+            patterns: compile_patterns(&patterns()),
+            config: config(),
+            auto_respond_config: auto_respond_config_with_safe_rule(r"❯\s*\d+\."),
+            log_path: None,
+        });
+
+        l.step();
+        l.step();
+        l.step();
+        let r = l.step();
+        // TOCTOU check failed → no event, no keys sent.
+        assert!(r.event.is_none(), "no event when TOCTOU fails");
+        assert!(
+            sent_keys.lock().unwrap().is_empty(),
+            "no keys sent when TOCTOU fails"
+        );
+    }
+
+    #[test]
+    fn send_keys_failure_routes_event_to_llm() {
+        let frames: Vec<String> = vec![
+            "● working on it".to_string(),
+            "● working on it\n❯ 1. Proceed?".to_string(),
+            "● working on it\n❯ 1. Proceed?".to_string(),
+            "● working on it\n❯ 1. Proceed?".to_string(),
+        ];
+        let mut fi = 0usize;
+        let frames_cap = frames.clone();
+        let capture_fn = move || {
+            let idx = fi.min(frames_cap.len() - 1);
+            fi += 1;
+            Ok(frames_cap[idx].clone())
+        };
+
+        let mut l = WatchLoop::new(WatchLoopDeps {
+            session: "s1".to_string(),
+            capture_fn,
+            send_keys_fn: |_: &[String]| {
+                Err(io::Error::other("simulated send-keys failure"))
+            },
+            patterns: compile_patterns(&patterns()),
+            config: config(),
+            auto_respond_config: auto_respond_config_with_safe_rule(r"❯\s*\d+\."),
+            log_path: None,
+        });
+
+        l.step();
+        l.step();
+        l.step();
+        let r = l.step();
+        // Failure → event routed to LLM as a StateTransition, never panics.
+        let event = r.event.expect("event still emitted on send-keys failure");
+        assert_eq!(event.state, PaneState::WaitingInput);
+        assert!(matches!(event.reason, DecisionReason::StateTransition));
     }
 }

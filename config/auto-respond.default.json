@@ -1,0 +1,14 @@
+{
+  "enabled": false,
+  "rules": [],
+  "limits": {
+    "maxAutoResponsesPerSession": 20,
+    "maxAutoResponsesPerRulePerHour": 10,
+    "cooldownMsAfterResponse": 5000,
+    "requireStableIdleMs": 2000
+  },
+  "notify": {
+    "telegramOnEveryAutoResponse": false,
+    "emitEventToDecideLoop": true
+  }
+}

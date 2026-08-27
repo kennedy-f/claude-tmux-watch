@@ -1,0 +1,27 @@
+{
+  "_comment": "Example auto-respond rules. Copy this file to your profile home as tmux-watch.auto-respond.json and enable the rules you need.",
+  "enabled": false,
+  "rules": [
+    {
+      "_comment": "Example 1: Claude Code trust-folder prompt (safe — always answer 1/Enter)",
+      "id": "claude-code-trust-folder",
+      "match": "Do you trust the files in this folder\\?",
+      "keys": ["1", "Enter"],
+      "risk": "safe",
+      "enabled": false
+    },
+    {
+      "_comment": "Example 2: Generic (y/n) confirmation — only allowed when the rolling context confirms we are inside a safe build/test command.",
+      "id": "yn-build-test-confirm",
+      "match": "\\(y/n\\)\\s*$",
+      "keys": ["y", "Enter"],
+      "risk": "confirm",
+      "requiresContextAllow": [
+        "cargo build",
+        "cargo test",
+        "npm install"
+      ],
+      "enabled": false
+    }
+  ]
+}

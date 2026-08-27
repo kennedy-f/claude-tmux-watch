@@ -66,6 +66,15 @@ pub fn load_patterns_layered(
     Ok(serde_json::from_value(merged)?)
 }
 
+/// Returns the merged `Value` for auto-respond config (caller converts to typed struct).
+/// Public for use by `auto_respond.rs`.
+pub fn load_auto_respond_value(
+    default_path: &Path,
+    override_path: Option<&Path>,
+) -> anyhow::Result<serde_json::Value> {
+    load_layered_value(default_path, &[override_path])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
